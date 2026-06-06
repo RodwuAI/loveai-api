@@ -1,4 +1,5 @@
 mod ai;
+mod asr;
 mod prompt;
 mod state;
 mod usage;
@@ -13,6 +14,10 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use state::AppState;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::IntoResponse;
+use futures::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() {
@@ -22,6 +27,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/ai/qa", post(qa_handler))
         .route("/ai/image", post(image_handler))
+        .route("/ai/voice", get(voice_handler))
         .layer(CorsLayer::permissive())
         .with_state(AppState::new());
 
@@ -53,6 +59,63 @@ async fn image_handler(
         })),
         ai::ImageOutcome::Error(e) => Json(json!({"status": "error", "message": e})),
     }
+}
+
+/// 语音识别（火山流式 ASR）：浏览器 WS 上传 16k PCM，回传 partial/final 字幕。
+/// 未配置火山 key → 立即回 error 事件并关闭（前端可降级到设备语音）。
+async fn voice_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(handle_voice_socket)
+}
+
+async fn handle_voice_socket(socket: WebSocket) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    if !asr::is_configured() {
+        let _ = ws_tx
+            .send(Message::Text(
+                "{\"type\":\"error\",\"text\":\"asr_not_configured\"}".to_string(),
+            ))
+            .await;
+        return;
+    }
+
+    let (audio_tx, audio_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (event_tx, mut event_rx) = mpsc::channel::<asr::AsrClientEvent>(64);
+
+    let pipe = tokio::spawn(async move {
+        if let Err(e) = asr::pipe(0, audio_rx, event_tx).await {
+            eprintln!("asr pipe error: {e}");
+        }
+    });
+
+    let to_browser = tokio::spawn(async move {
+        while let Some(ev) = event_rx.recv().await {
+            let j = serde_json::to_string(&ev).unwrap_or_default();
+            if ws_tx.send(Message::Text(j)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    while let Some(Ok(msg)) = ws_rx.next().await {
+        match msg {
+            Message::Binary(b) => {
+                if audio_tx.send(b).await.is_err() {
+                    break;
+                }
+            }
+            Message::Text(t) => {
+                if t.contains("end") {
+                    let _ = audio_tx.send(Vec::new()).await;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    drop(audio_tx);
+    let _ = pipe.await;
+    to_browser.abort();
 }
 
 /// 免费额度（终身），env 可调，默认 10 次 AI 问答。
