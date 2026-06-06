@@ -9,11 +9,11 @@ echo
 
 read -s -p "粘贴豆包 API key: " DOUBAO; echo
 if [ -z "$DOUBAO" ]; then echo "❌ 没输入 key，已退出。"; exit 1; fi
-read -p "豆包接入点ID或模型名 [默认 doubao-pro-32k]: " DM
+read -p "豆包接入点ID或模型名 [默认 doubao-seed-2-0-pro-260215]: " DM
 
 {
   echo "AI_BASE_URL=https://ark.cn-beijing.volces.com/api/v3"
-  echo "AI_MODEL=${DM:-doubao-pro-32k}"
+  echo "AI_MODEL=${DM:-doubao-seed-2-0-pro-260215}"
   echo "AI_API_KEY=$DOUBAO"
   echo "AI_FREE_LIMIT=10"
   echo "PORT=8800"

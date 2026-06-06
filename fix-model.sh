@@ -12,11 +12,10 @@ if [ -n "$1" ]; then
   CANDS=("$@")
 else
   CANDS=(
-    doubao-pro-32k-241215
+    doubao-seed-2-0-pro-260215
+    doubao-seed-2-0-lite-260428
     doubao-1-5-pro-32k-250115
-    doubao-pro-32k-240828
-    doubao-1-5-pro-32k-character-250228
-    doubao-pro-32k-character-241215
+    doubao-pro-32k-241215
     doubao-seed-1-6-250615
     doubao-pro-4k-240515
     doubao-lite-32k-240828
