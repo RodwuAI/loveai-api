@@ -1,12 +1,14 @@
 mod ai;
 mod asr;
+mod pay;
 mod prompt;
 mod state;
+mod subscription;
 mod usage;
 
 use axum::{
     extract::State,
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -28,6 +30,10 @@ async fn main() {
         .route("/ai/qa", post(qa_handler))
         .route("/ai/image", post(image_handler))
         .route("/ai/voice", get(voice_handler))
+        .route("/sub/status", get(sub_status_handler))
+        .route("/sub/order", post(sub_order_handler))
+        .route("/sub/webhook", post(sub_webhook_handler))
+        .route("/sub/grant", post(sub_grant_handler))
         .layer(CorsLayer::permissive())
         .with_state(AppState::new());
 
@@ -134,13 +140,9 @@ async fn qa_handler(
     headers: HeaderMap,
     Json(req): Json<prompt::QaRequest>,
 ) -> Json<serde_json::Value> {
-    let user = headers
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "anonymous".to_string());
+    let user = user_from(&headers);
 
+    let premium = st.subscription.is_premium(&user);
     let limit = free_limit();
     let used = st.usage.get(&user);
 
@@ -153,13 +155,13 @@ async fn qa_handler(
         "sent_chars": resolved.audit.sent_chars,
     });
 
-    // 配额闸：免费额度用完 → 引导订阅，不调 LLM。
-    if used >= limit {
+    // 配额闸：仅对免费用户生效；会员（premium）跳过 → 无限 LOVEAI。
+    if !premium && used >= limit {
         return Json(json!({
             "status": "quota_exceeded",
             "message": "免费次数已用完，升级解锁更多 LOVEAI 关心",
             "model": "LOVEAI",
-            "usage": {"used": used, "limit": limit, "remaining": 0},
+            "usage": usage_json(premium, used, limit),
             "audit": audit
         }));
     }
@@ -169,26 +171,148 @@ async fn qa_handler(
             let new_used = st.usage.increment(&user);
             Json(json!({
                 "status": "ok", "answer": a, "cached": false, "model": "LOVEAI",
-                "usage": {"used": new_used, "limit": limit, "remaining": limit.saturating_sub(new_used)},
+                "usage": usage_json(premium, new_used, limit),
                 "audit": audit
             }))
         }
         ai::AiOutcome::Cached(a) => Json(json!({
             "status": "ok", "answer": a, "cached": true, "model": "LOVEAI",
-            "usage": {"used": used, "limit": limit, "remaining": limit.saturating_sub(used)},
+            "usage": usage_json(premium, used, limit),
             "audit": audit
         })),
         ai::AiOutcome::NeedsApiKey => Json(json!({
             "status": "needs_api_key",
             "message": "后端未配置 AI_API_KEY；填入后即返回真实回答（绝不使用假数据）。",
             "model": "LOVEAI",
-            "usage": {"used": used, "limit": limit, "remaining": limit.saturating_sub(used)},
+            "usage": usage_json(premium, used, limit),
             "audit": audit
         })),
         ai::AiOutcome::Error(e) => Json(json!({
             "status": "error", "message": e, "model": "LOVEAI",
-            "usage": {"used": used, "limit": limit, "remaining": limit.saturating_sub(used)},
+            "usage": usage_json(premium, used, limit),
             "audit": audit
         })),
     }
+}
+
+/// 从 X-User-Id 头解析用户标识；缺省 anonymous。权威计量/会员都以此为键。
+fn user_from(headers: &HeaderMap) -> String {
+    headers
+        .get("x-user-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "anonymous".to_string())
+}
+
+/// 统一用量 JSON。会员 remaining=-1（前端识别为「无限」）。
+fn usage_json(premium: bool, used: u32, limit: u32) -> serde_json::Value {
+    if premium {
+        json!({"premium": true, "used": used, "limit": limit, "remaining": -1})
+    } else {
+        json!({"premium": false, "used": used, "limit": limit, "remaining": limit.saturating_sub(used)})
+    }
+}
+
+/// 套餐目录 JSON（前端订阅页渲染用）。
+fn plans_json() -> serde_json::Value {
+    json!(pay::PLANS)
+}
+
+/// GET /sub/status：当前会员态 + 套餐目录 + 支付是否就绪。
+async fn sub_status_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    let user = user_from(&headers);
+    let rec = st.subscription.status(&user);
+    let premium = st.subscription.is_premium(&user);
+    Json(json!({
+        "status": "ok",
+        "plan": rec.plan,
+        "premium": premium,
+        "expires_at": rec.expires_at,
+        "pay_ready": pay::provider().is_some(),
+        "plans": plans_json(),
+    }))
+}
+
+/// POST /sub/order {plan}：创建订单。无商户密钥 → needs_config（诚实降级，绝不假成功）。
+async fn sub_order_handler(
+    State(_st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let user = user_from(&headers);
+    let plan_id = req["plan"].as_str().unwrap_or("").trim();
+    let Some(plan) = pay::find_plan(plan_id) else {
+        return Json(json!({"status": "error", "message": "未知套餐"}));
+    };
+    match pay::create_order(plan, &user) {
+        pay::OrderOutcome::NeedsConfig => Json(json!({
+            "status": "needs_config",
+            "message": "支付即将开通：商户号配置好后即可购买。",
+            "plan": plan.id,
+            "price_cents": plan.price_cents,
+        })),
+        pay::OrderOutcome::Ready { provider, order_id, pay_payload } => Json(json!({
+            "status": "ok",
+            "provider": provider,
+            "order_id": order_id,
+            "pay": pay_payload,
+        })),
+    }
+}
+
+/// POST /sub/webhook：支付渠道异步回调 → 验签 → 激活会员（幂等）。P2 实接验签。
+async fn sub_webhook_handler(
+    State(st): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    match pay::verify_webhook(&payload) {
+        Some((user, plan_id)) => {
+            if let Some(plan) = pay::find_plan(&plan_id) {
+                st.subscription.activate(&user, "plus", plan.days);
+                Json(json!({"status": "ok"}))
+            } else {
+                Json(json!({"status": "error", "message": "未知套餐"}))
+            }
+        }
+        None => Json(json!({"status": "error", "message": "验签失败或未配置"})),
+    }
+}
+
+/// POST /sub/grant {plan, user?, days?}：管理员手动开通会员（赠送/客服补单/测试）。
+/// 需 X-Admin-Token 头匹配 env ADMIN_TOKEN；未配置或不匹配 → 403。绝不公开开放。
+async fn sub_grant_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let admin = std::env::var("ADMIN_TOKEN").unwrap_or_default();
+    let provided = headers
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if admin.trim().is_empty() || provided != admin {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let target = req["user"]
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| user_from(&headers));
+    let plan_id = req["plan"].as_str().unwrap_or("plus_month").trim();
+    // days 优先取请求覆盖，否则按套餐目录；都没有则按 plus_month。
+    let days = req["days"]
+        .as_u64()
+        .map(|d| Some(d as u32))
+        .unwrap_or_else(|| pay::find_plan(plan_id).map(|p| p.days).unwrap_or(Some(30)));
+    let rec = st.subscription.activate(&target, "plus", days);
+    Ok(Json(json!({
+        "status": "ok",
+        "user": target,
+        "plan": rec.plan,
+        "expires_at": rec.expires_at,
+    })))
 }
