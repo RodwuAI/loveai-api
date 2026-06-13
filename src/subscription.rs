@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +36,10 @@ fn now_secs() -> i64 {
 pub struct SubscriptionStore {
     path: PathBuf,
     map: Mutex<HashMap<String, SubRecord>>,
+    /// 已处理过的支付回调事件 id（Stripe 会重发 webhook）。仅内存去重，
+    /// 避免同一笔支付被重复续期叠加天数。进程重启会清空 → 极端情况最多重复
+    /// 续期一次（activate 幂等续期，业务可接受）；上量再落 Redis/DB。
+    processed: Mutex<HashSet<String>>,
 }
 
 impl SubscriptionStore {
@@ -48,13 +52,19 @@ impl SubscriptionStore {
         Self {
             path: p,
             map: Mutex::new(map),
+            processed: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// 幂等去重：首次见到该事件 key 返回 true（应处理）；重复返回 false（跳过）。
+    pub fn mark_processed(&self, event_key: &str) -> bool {
+        self.processed.lock().unwrap_or_else(|e| e.into_inner()).insert(event_key.to_string())
     }
 
     pub fn status(&self, user: &str) -> SubRecord {
         self.map
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(user)
             .cloned()
             .unwrap_or_else(SubRecord::free)
@@ -66,7 +76,7 @@ impl SubscriptionStore {
 
     /// 激活/续期会员。days=None → 终身；有效期未过则在其上叠加（续期）。返回新记录。
     pub fn activate(&self, user: &str, plan: &str, days: Option<u32>) -> SubRecord {
-        let mut m = self.map.lock().unwrap();
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         let now = now_secs();
         let base = m
             .get(user)
@@ -112,6 +122,23 @@ mod tests {
         assert!(r.is_premium("u1"));
         assert!(r.is_premium("u2"));
         assert!(!r.is_premium("u3"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mark_processed_dedups() {
+        let path = std::env::temp_dir()
+            .join(format!("xs_sub_dedup_{}.json", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let s = SubscriptionStore::load(&path);
+        // 首次 → true（应处理）；重发 → false（跳过）。
+        assert!(s.mark_processed("cs_test_1"));
+        assert!(!s.mark_processed("cs_test_1"));
+        assert!(s.mark_processed("cs_test_2"));
 
         let _ = std::fs::remove_file(&path);
     }

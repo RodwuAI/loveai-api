@@ -152,7 +152,7 @@ pub async fn call_ai(
 
     // 缓存命中（同请求 + 同逻辑模型 + 同历史）→ 不调 LLM。
     let ck = cache_key(resolved, model, history);
-    if let Some(ans) = state.cache.lock().unwrap().get(&ck).cloned() {
+    if let Some(ans) = state.cache.lock().unwrap_or_else(|e| e.into_inner()).get(&ck).cloned() {
         return AiOutcome::Cached(ans);
     }
 
@@ -181,7 +181,7 @@ pub async fn call_ai(
         match call_provider(&state.client, p, &messages).await {
             ProviderResult::Ok(content) => {
                 {
-                    let mut c = state.cache.lock().unwrap();
+                    let mut c = state.cache.lock().unwrap_or_else(|e| e.into_inner());
                     if c.len() > 500 {
                         c.clear();
                     }

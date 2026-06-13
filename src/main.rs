@@ -237,9 +237,12 @@ async fn sub_status_handler(
     }))
 }
 
-/// POST /sub/order {plan}：创建订单。无商户密钥 → needs_config（诚实降级，绝不假成功）。
+/// POST /sub/order {plan}：创建订单。
+/// - PAY_PROVIDER=stripe 且配 STRIPE_SECRET_KEY → 真调 Stripe，返回跳转 url。
+/// - 未配置/国内渠道未实现 → needs_config（诚实降级，绝不假成功）。
+/// - 下单出错（网络/HTTP）→ error（如实上报）。
 async fn sub_order_handler(
-    State(_st): State<AppState>,
+    State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
@@ -248,7 +251,7 @@ async fn sub_order_handler(
     let Some(plan) = pay::find_plan(plan_id) else {
         return Json(json!({"status": "error", "message": "未知套餐"}));
     };
-    match pay::create_order(plan, &user) {
+    match pay::create_order(&st.client, plan, &user).await {
         pay::OrderOutcome::NeedsConfig => Json(json!({
             "status": "needs_config",
             "message": "支付即将开通：商户号配置好后即可购买。",
@@ -261,24 +264,47 @@ async fn sub_order_handler(
             "order_id": order_id,
             "pay": pay_payload,
         })),
+        pay::OrderOutcome::Error(e) => Json(json!({
+            "status": "error",
+            "message": e,
+        })),
     }
 }
 
-/// POST /sub/webhook：支付渠道异步回调 → 验签 → 激活会员（幂等）。P2 实接验签。
+/// POST /sub/webhook：Stripe 异步回调 → 原始 body + Stripe-Signature 验签 → 激活会员。
+/// 幂等：Stripe 会重发同一事件，按 session/event id 去重避免重复续期叠加天数。
+/// 验签失败/非目标事件/缺密钥 → 400（绝不假激活）。注意 body 提取器必须放最后。
 async fn sub_webhook_handler(
     State(st): State<AppState>,
-    Json(payload): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    match pay::verify_webhook(&payload) {
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let secret = std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
+    let sig = headers
+        .get("stripe-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    match pay::verify_webhook(&secret, sig, &body) {
         Some((user, plan_id)) => {
-            if let Some(plan) = pay::find_plan(&plan_id) {
+            let Some(plan) = pay::find_plan(&plan_id) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"status": "error", "message": "未知套餐"})),
+                );
+            };
+            // 幂等去重：同一 session/event 重发只续期一次。
+            let key = pay::event_dedup_key(&body).unwrap_or_else(|| format!("{user}:{plan_id}"));
+            if st.subscription.mark_processed(&key) {
                 st.subscription.activate(&user, "plus", plan.days);
-                Json(json!({"status": "ok"}))
-            } else {
-                Json(json!({"status": "error", "message": "未知套餐"}))
             }
+            // 已处理过也回 200，让 Stripe 停止重发。
+            (StatusCode::OK, Json(json!({"status": "ok"})))
         }
-        None => Json(json!({"status": "error", "message": "验签失败或未配置"})),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "message": "验签失败或未配置"})),
+        ),
     }
 }
 

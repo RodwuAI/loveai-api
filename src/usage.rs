@@ -23,12 +23,12 @@ impl UsageStore {
     }
 
     pub fn get(&self, user: &str) -> u32 {
-        *self.map.lock().unwrap().get(user).unwrap_or(&0)
+        *self.map.lock().unwrap_or_else(|e| e.into_inner()).get(user).unwrap_or(&0)
     }
 
     /// 计数 +1，持久化，返回新值。
     pub fn increment(&self, user: &str) -> u32 {
-        let mut m = self.map.lock().unwrap();
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         let c = m.entry(user.to_string()).or_insert(0);
         *c += 1;
         let v = *c;
