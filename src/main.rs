@@ -8,12 +8,12 @@ mod usage;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, Method, StatusCode},
     routing::{get, post},
     Json, Router,
 };
 use serde_json::json;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use state::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -34,7 +34,7 @@ async fn main() {
         .route("/sub/order", post(sub_order_handler))
         .route("/sub/webhook", post(sub_webhook_handler))
         .route("/sub/grant", post(sub_grant_handler))
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(AppState::new());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8800".to_string());
@@ -46,6 +46,30 @@ async fn main() {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok", "service": "xinshang_backend"}))
+}
+
+/// CORS：收敛到已知前端来源（env `CORS_ALLOWED_ORIGINS` 逗号分隔可覆盖；默认生产域 + 本地开发）。
+/// 仅放行 GET/POST + 业务自定义头；其它来源浏览器侧被拒。
+/// 注：支付 webhook 是支付方服务器直连（无浏览器、无预检），不受 CORS 影响。
+fn cors_layer() -> CorsLayer {
+    let raw = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| {
+        "https://www.loveaivip.com,https://loveaivip.com,http://localhost:8080,http://127.0.0.1:8080"
+            .to_string()
+    });
+    let origins: Vec<axum::http::HeaderValue> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("x-user-id"),
+            HeaderName::from_static("x-admin-token"),
+        ])
 }
 
 /// 生图（§9）：{prompt} → 图片 URL。未配置生图模型 → needs_config。
