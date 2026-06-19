@@ -1,5 +1,6 @@
 mod ai;
 mod asr;
+mod auth;
 mod pay;
 mod prompt;
 mod state;
@@ -27,6 +28,9 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/auth/register", post(auth_register_handler))
+        .route("/auth/login", post(auth_login_handler))
+        .route("/auth/me", get(auth_me_handler))
         .route("/ai/qa", post(qa_handler))
         .route("/ai/image", post(image_handler))
         .route("/ai/voice", get(voice_handler))
@@ -69,6 +73,8 @@ fn cors_layer() -> CorsLayer {
             HeaderName::from_static("content-type"),
             HeaderName::from_static("x-user-id"),
             HeaderName::from_static("x-admin-token"),
+            // 账号体系：登录后请求带 Authorization: Bearer <jwt>
+            HeaderName::from_static("authorization"),
         ])
 }
 
@@ -164,7 +170,8 @@ async fn qa_handler(
     headers: HeaderMap,
     Json(req): Json<prompt::QaRequest>,
 ) -> Json<serde_json::Value> {
-    let user = user_from(&headers);
+    // 登录则用可信账号 id；未登录回退设备 id（过渡期）。
+    let user = auth_user(&headers).unwrap_or_else(|| user_from(&headers));
 
     let premium = st.subscription.is_premium(&user);
     let limit = free_limit();
@@ -229,6 +236,97 @@ fn user_from(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "anonymous".to_string())
 }
 
+/// 解析可信账号身份：Authorization: Bearer <jwt> → 校验 → Some(账号 id)；
+/// 无 token / 非法 / 过期 → None（调用方回退 user_from 设备 id）。
+/// 这是根治「X-User-Id 可伪造」的核心：账号 id 由签名 token 背书，客户端改不了。
+fn auth_user(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get("authorization").and_then(|v| v.to_str().ok())?;
+    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    auth::verify(token.trim())
+}
+
+/// 设备 → 账号迁移（注册/登录成功后调）：把请求头里的过渡期设备 id（X-User-Id）
+/// 的用量与会员搬到账号 id 上。幂等，可重复执行。device 缺省/等于账号则跳过。
+fn migrate_device_to_account(st: &AppState, headers: &HeaderMap, account_id: &str) {
+    let device = user_from(headers);
+    if device == account_id || device == "anonymous" {
+        return;
+    }
+    // usage：账号计数取 max(账号, 设备)，免费次数不丢。
+    st.usage.merge_max(&device, account_id);
+    // subscription：设备会员更优则搬到账号（到期更晚/终身优先）。
+    st.subscription.merge_better(&device, account_id);
+}
+
+/// POST /auth/register {email,password}：注册并签发 token。
+/// 200 {token,user} | 409 {error:"email_taken"} | 400 {error:"invalid"}
+async fn auth_register_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let email = req["email"].as_str().unwrap_or("");
+    let password = req["password"].as_str().unwrap_or("");
+    match st.users.register(email, password) {
+        Ok(user) => {
+            migrate_device_to_account(&st, &headers, &user.id);
+            let token = auth::issue(&user.id);
+            (
+                StatusCode::OK,
+                Json(json!({"token": token, "user": {"id": user.id, "email": user.email}})),
+            )
+        }
+        Err("email_taken") => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "email_taken"})),
+        ),
+        Err(_) => (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid"}))),
+    }
+}
+
+/// POST /auth/login {email,password}：校验并签发 token。
+/// 200 {token,user} | 401 {error:"bad_credentials"}
+async fn auth_login_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let email = req["email"].as_str().unwrap_or("");
+    let password = req["password"].as_str().unwrap_or("");
+    match st.users.login(email, password) {
+        Some(user) => {
+            migrate_device_to_account(&st, &headers, &user.id);
+            let token = auth::issue(&user.id);
+            (
+                StatusCode::OK,
+                Json(json!({"token": token, "user": {"id": user.id, "email": user.email}})),
+            )
+        }
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "bad_credentials"})),
+        ),
+    }
+}
+
+/// GET /auth/me（Authorization: Bearer <token>）：返回当前账号。
+/// 200 {id,email} | 401（无/无效 token 或账号不存在）
+async fn auth_me_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(uid) = auth_user(&headers) else {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})));
+    };
+    match st.users.get(&uid) {
+        Some(user) => (
+            StatusCode::OK,
+            Json(json!({"id": user.id, "email": user.email})),
+        ),
+        None => (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))),
+    }
+}
+
 /// 统一用量 JSON。会员 remaining=-1（前端识别为「无限」）。
 fn usage_json(premium: bool, used: u32, limit: u32) -> serde_json::Value {
     if premium {
@@ -248,7 +346,7 @@ async fn sub_status_handler(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Json<serde_json::Value> {
-    let user = user_from(&headers);
+    let user = auth_user(&headers).unwrap_or_else(|| user_from(&headers));
     let rec = st.subscription.status(&user);
     let premium = st.subscription.is_premium(&user);
     Json(json!({
@@ -270,7 +368,7 @@ async fn sub_order_handler(
     headers: HeaderMap,
     Json(req): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let user = user_from(&headers);
+    let user = auth_user(&headers).unwrap_or_else(|| user_from(&headers));
     let plan_id = req["plan"].as_str().unwrap_or("").trim();
     let Some(plan) = pay::find_plan(plan_id) else {
         return Json(json!({"status": "error", "message": "未知套餐"}));

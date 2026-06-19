@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
+use crate::auth::UserStore;
 use crate::subscription::SubscriptionStore;
 use crate::usage::UsageStore;
 
@@ -16,6 +17,7 @@ pub struct AppState {
     pub cache: Arc<Mutex<HashMap<u64, String>>>,
     pub usage: Arc<UsageStore>,
     pub subscription: Arc<SubscriptionStore>,
+    pub users: Arc<UserStore>,
 }
 
 impl AppState {
@@ -32,6 +34,7 @@ impl AppState {
             cache: Arc::new(Mutex::new(HashMap::new())),
             usage: Arc::new(UsageStore::load("usage.json")),
             subscription: Arc::new(SubscriptionStore::load("subscription.json")),
+            users: Arc::new(UserStore::load("users.json")),
         }
     }
 }
