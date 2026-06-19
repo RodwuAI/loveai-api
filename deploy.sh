@@ -18,8 +18,11 @@ fi
 # 3. 构建 + 运行（80 端口对外，容器内 8800；崩溃自动重启）
 echo ">> 构建镜像..."
 docker build -t loveai-api .
+# 账号/用量/会员 JSON 存到容器外宿主机目录，重建容器不丢数据。
+mkdir -p "$HOME/loveai-data"
 docker rm -f loveai 2>/dev/null || true
-docker run -d --restart always -p 80:8800 --env-file .env --name loveai loveai-api
+docker run -d --restart always -p 80:8800 --env-file .env \
+  -v "$HOME/loveai-data":/app --name loveai loveai-api
 
 # 4. 自检
 sleep 3
