@@ -1,8 +1,10 @@
 mod ai;
 mod asr;
 mod auth;
+mod inspire;
 mod pay;
 mod prompt;
+mod quiz;
 mod state;
 mod subscription;
 mod usage;
@@ -38,6 +40,9 @@ async fn main() {
         .route("/sub/order", post(sub_order_handler))
         .route("/sub/webhook", post(sub_webhook_handler))
         .route("/sub/grant", post(sub_grant_handler))
+        .route("/ai/inspire", post(inspire_handler))
+        .route("/ai/ghostwrite", post(ghostwrite_handler))
+        .route("/ai/quiz/generate", post(quiz_generate_handler))
         .layer(cors_layer())
         .with_state(AppState::new());
 
@@ -463,4 +468,97 @@ async fn sub_grant_handler(
         "plan": rec.plan,
         "expires_at": rec.expires_at,
     })))
+}
+
+async fn inspire_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<inspire::InspireRequest>,
+) -> Json<serde_json::Value> {
+    let user = user_from(&headers);
+    let premium = st.subscription.is_premium(&user);
+    let limit = free_limit();
+    let used = st.usage.get(&user);
+    if !premium && used >= limit {
+        return Json(json!({"status": "quota_exceeded", "message": "免费次数已用完，升级解锁更多 LOVEAI 关心"}));
+    }
+    let resolved = inspire::resolve_inspire(&req);
+    let model = ai::resolve_model(Some("generate"));
+    match ai::call_ai(&st, &resolved, &model, &[]).await {
+        ai::AiOutcome::Answer(a) => {
+            let clean = a.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+            let parsed = serde_json::from_str::<serde_json::Value>(clean)
+                .unwrap_or_else(|_| json!({"suggestions": []}));
+            st.usage.increment(&user);
+            Json(json!({"status": "ok", "suggestions": parsed["suggestions"]}))
+        }
+        ai::AiOutcome::Cached(a) => {
+            let clean = a.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+            let parsed = serde_json::from_str::<serde_json::Value>(clean)
+                .unwrap_or_else(|_| json!({"suggestions": []}));
+            Json(json!({"status": "ok", "suggestions": parsed["suggestions"]}))
+        }
+        ai::AiOutcome::NeedsApiKey => Json(json!({"status": "needs_api_key"})),
+        ai::AiOutcome::Error(e) => Json(json!({"status": "error", "message": e})),
+    }
+}
+
+async fn ghostwrite_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<inspire::GhostwriteRequest>,
+) -> Json<serde_json::Value> {
+    let user = user_from(&headers);
+    let premium = st.subscription.is_premium(&user);
+    let limit = free_limit();
+    let used = st.usage.get(&user);
+    if !premium && used >= limit {
+        return Json(json!({"status": "quota_exceeded", "message": "免费次数已用完"}));
+    }
+    let resolved = inspire::resolve_ghostwrite(&req);
+    let model = ai::resolve_model(Some("generate"));
+    match ai::call_ai(&st, &resolved, &model, &[]).await {
+        ai::AiOutcome::Answer(a) => {
+            st.usage.increment(&user);
+            Json(json!({"status": "ok", "content": a.trim()}))
+        }
+        ai::AiOutcome::Cached(a) => {
+            Json(json!({"status": "ok", "content": a.trim()}))
+        }
+        ai::AiOutcome::NeedsApiKey => Json(json!({"status": "needs_api_key"})),
+        ai::AiOutcome::Error(e) => Json(json!({"status": "error", "message": e})),
+    }
+}
+
+async fn quiz_generate_handler(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<quiz::QuizRequest>,
+) -> Json<serde_json::Value> {
+    let user = user_from(&headers);
+    let premium = st.subscription.is_premium(&user);
+    let limit = free_limit();
+    let used = st.usage.get(&user);
+    if !premium && used >= limit {
+        return Json(json!({"status": "quota_exceeded", "message": "免费次数已用完"}));
+    }
+    let resolved = quiz::resolve_quiz(&req);
+    let model = ai::resolve_model(Some("generate"));
+    match ai::call_ai(&st, &resolved, &model, &[]).await {
+        ai::AiOutcome::Answer(a) => {
+            let clean = a.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+            let parsed = serde_json::from_str::<serde_json::Value>(clean)
+                .unwrap_or_else(|_| json!({"questions": []}));
+            st.usage.increment(&user);
+            Json(json!({"status": "ok", "questions": parsed["questions"]}))
+        }
+        ai::AiOutcome::Cached(a) => {
+            let clean = a.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+            let parsed = serde_json::from_str::<serde_json::Value>(clean)
+                .unwrap_or_else(|_| json!({"questions": []}));
+            Json(json!({"status": "ok", "questions": parsed["questions"]}))
+        }
+        ai::AiOutcome::NeedsApiKey => Json(json!({"status": "needs_api_key"})),
+        ai::AiOutcome::Error(e) => Json(json!({"status": "error", "message": e})),
+    }
 }
